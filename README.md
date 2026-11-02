@@ -54,6 +54,8 @@ TP1/
 
 O CSV é procurado automaticamente dentro de `dataset/`. Os volumes seguem o padrão `<pid>_..._acq<N>.nii.gz` e as máscaras `<pid>_..mask...nii.gz`.
 
+O dataset está presente para download em: "https://zenodo.org/records/18114231/files/BreastDCEDL_ISPY1_min_crop.tar.gz?download=1".
+
 ---
 
 ## 3. Instalação
