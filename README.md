@@ -133,6 +133,15 @@ python trabalho_pcr_dce_mri.py --train-all --epochs 15 --aug-train 3 --models re
 | `--aug-val` | Variações por corte na validação (1–10) | 10 |
 | `--models` | `cnn`, `resnet50`, `novel` (separados por vírgula) | todos |
 | `--phases` | `pre`, `early`, `late`, `all` (separados por vírgula) | todas |
+| `--avaliar` | Avalia um modelo `.pt` já treinado no CSV/pasta indicados (ex.: teste surpresa), sem treinar | – |
+
+### 4.5 Conjunto-teste surpresa
+
+```
+python trabalho_pcr_dce_mri.py --avaliar saida_trabalho/modelos/novel_all_none.pt --data-dir pasta_nova --csv pasta_nova/arquivo.csv
+```
+
+Se o CSV não tiver a coluna `test`, todos os pacientes são tratados como teste; se não tiver `pCR`, só as previsões são geradas (salvas em `resultados/previsoes_<modelo>.csv`). Na interface: carregue a pasta/CSV novos e use o botão **Avaliar no conjunto de teste** da aba Classificar + Grad-CAM.
 
 ---
 
@@ -151,6 +160,8 @@ python trabalho_pcr_dce_mri.py --train-all --epochs 15 --aug-train 3 --models re
 
 - `saida_trabalho/modelos/<modelo>_<fase>_<mascara>.pt` – pesos e limiares (para **não** precisar retreinar na apresentação).
 - `saida_trabalho/resultados/<modelo>_<fase>_<mascara>.json` – métricas, histórico de loss, tempo de treino e previsões do teste.
+- `saida_trabalho/resultados/<modelo>_<fase>_<mascara>_loss.png` – gráfico de convergência da loss (para o relatório).
+- `saida_trabalho/resultados/historico_experimentos.csv` – uma linha por treino (hiperparâmetros + métricas). Não é sobrescrito, então serve para comparar as tentativas de ajuste de hiperparâmetros no relatório.
 
 ---
 
