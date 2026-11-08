@@ -1,7 +1,14 @@
 """
 Trabalho Prático: Classificação da resposta ao tratamento do câncer de mama (pCR) usando redes neurais e DCE-MRI (BreastDCEDL / I-SPY1)
 
-  1. Daniel Salgado Magalhães - 821429
+PUC Minas - ICEI - Ciência da Computação - Campus <PREENCHER>
+Processamento e Análise de Imagens - Prof. Alexei Machado
+
+GRUPO (nome - matrícula):
+  1. Caio Gomes              - <PREENCHER>
+  2. Daniel Salgado Magalhães - 821429
+  3. Nalberth <SOBRENOME>     - <PREENCHER>
+  4. Vitor Alexandre <SOBRENOME> - <PREENCHER>
 ===============================================================================
 
 COMO EXECUTAR
@@ -10,6 +17,8 @@ COMO EXECUTAR
   python trabalho_pcr_dce_mri.py                 -> abre a interface gráfica
   python trabalho_pcr_dce_mri.py --train-all     -> treina tudo sem interface
   python trabalho_pcr_dce_mri.py --selftest      -> teste rápido com dados sintéticos
+  python trabalho_pcr_dce_mri.py --avaliar saida_trabalho/modelos/cnn_all_none.pt --csv novo.csv --data-dir nova_pasta
+                                                 -> avalia um modelo salvo em outro conjunto (ex.: teste surpresa)
 
 """
 
@@ -67,7 +76,9 @@ class Config:
     lr = 1e-3             # taxa de aprendizado da "cabeça" (camadas novas)
     backbone_lr_factor = 0.1   # backbone pré-treinado (se descongelado) usa lr*0.1
     weight_decay = 1e-4   # regularização L2 (AdamW) contra overfitting
-    patience = 7          # early stopping (épocas sem melhora da loss de validação)
+    patience = 7          # early stopping (épocas sem melhora na validação)
+    criterio = "auc"      # como escolher a melhor época: 'auc' (AUC de validação por paciente) ou 'loss'
+    tag = ""              # sufixo no nome do experimento (não sobrescreve rodadas anteriores)
     aug_train = 10        # variações por corte sorteadas por época (10 = todas)
     aug_val = 10          # variações por corte na validação
     loss_mode = "pos_weight"   # 'pos_weight' | 'focal' | 'none'
@@ -129,9 +140,9 @@ def seed_everything(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def run_name(spec):
-    # Nome único de um experimento: modelo_fase_mascara.
-    return "%s_%s_%s" % spec
+def run_name(spec, tag=""):
+    # Nome único de um experimento: modelo_fase_mascara[_tag].
+    return "%s_%s_%s" % tuple(spec) + ("_" + tag if tag else "")
 
 
 # ------------------------------------------------------------------------------
@@ -156,6 +167,10 @@ def find_csv(cfg):
 def read_meta(csv_path):
     # Lê o CSV de metadados (pid, pCR, test). O pandas aceita o fim de linha '\\r' do arquivo.
     df = pd.read_csv(csv_path)
+    if "test" not in df.columns:                 # ex.: CSV do conjunto-teste surpresa
+        df["test"] = 1                           # sem partição -> todos os pacientes viram "teste"
+    if "pCR" not in df.columns:                  # sem rótulo -> -1 (só gera previsões, sem métricas)
+        df["pCR"] = -1
     df = df.dropna(subset=["pCR", "test"]).copy()
     df["pCR"] = df["pCR"].astype(int)
     df["test"] = df["test"].astype(int)          # 0 = treino, 1 = teste, 2 = validação
@@ -269,11 +284,13 @@ def preprocess_patient(paths, mask_path, row, S, margin):
 def build_bank(meta, index, cfg, log=print):
     # Constrói (ou carrega do cache) o banco de cortes de todos os pacientes.
     os.makedirs(cfg.cache_dir, exist_ok=True)
-    cache = os.path.join(cfg.cache_dir, "bank_s%d_m%d.pt" % (cfg.img_size, cfg.slice_margin))
+    # o nome do cache inclui o CSV: assim o dataset de treino e um conjunto novo não se sobrescrevem
+    csv_name = os.path.splitext(os.path.basename(cfg.csv_path or "dados"))[0]
+    cache = os.path.join(cfg.cache_dir, "bank_%s_s%d_m%d.pt" % (csv_name, cfg.img_size, cfg.slice_margin))
     if os.path.exists(cache):
         try:
             d = torch.load(cache, weights_only=False)
-            if d["pids"] == [p for p in meta["pid"] if d["pids"].count(p)]:   # mesmos pacientes
+            if set(d["pids"]) <= set(meta["pid"]):                     # mesmos pacientes do CSV
                 log("Cache de pré-processamento carregado: " + cache)
                 b = Bank()
                 b.__dict__.update(d)
@@ -322,7 +339,7 @@ def describe_balance(bank, cfg, log=print):
     names = {0: "treino", 2: "validação", 1: "teste"}
     for s in (0, 2, 1):
         sel = bank.split_pat == s
-        n, pos = int(sel.sum()), int(bank.y_pat[sel].sum())
+        n, pos = int(sel.sum()), int((bank.y_pat[sel] == 1).sum())
         rows = bank.split_row == s
         log("  %-9s: %3d pacientes (pCR=%d, %.1f%%) | %4d cortes" %
             (names[s], n, pos, 100.0 * pos / max(n, 1), int(rows.sum())))
@@ -332,8 +349,10 @@ def describe_balance(bank, cfg, log=print):
     ratio = neg / max(pos, 1)
     log("Razão negativos:positivos no treino = %.2f:1 -> %s" %
         (ratio, "DESBALANCEAMENTO RELEVANTE" if ratio > 1.5 else "balanceado"))
-    log("Estratégia adotada: %s (pos_weight = %.2f; limiar escolhido na validação)." %
-        (cfg.loss_mode, ratio))
+    detalhe = {"pos_weight": "BCE com peso %.2f para a classe pCR" % ratio,
+               "focal": "focal loss (gamma = %.1f)" % cfg.focal_gamma,
+               "none": "BCE sem peso (sem tratamento)"}[cfg.loss_mode]
+    log("Estratégia adotada: %s; limiar escolhido na validação." % detalhe)
 
 
 # ------------------------------------------------------------------------------
@@ -699,13 +718,50 @@ def eval_loss(model, bank, pairs, spec, loss_fn, cfg, dev):
     return tot / max(n, 1)
 
 
+def save_loss_plot(name, hist, best_ep, out_dir):
+    # Salva a curva de convergência (loss treino x validação) em PNG, para usar no relatório.
+    try:
+        from matplotlib.figure import Figure as _Fig   # Figure sem janela (funciona sem GUI)
+        fig = _Fig(figsize=(6, 3.5), dpi=110)
+        ax = fig.subplots()
+        ep = np.arange(1, len(hist["train_loss"]) + 1)
+        ax.plot(ep, hist["train_loss"], label="treino")
+        ax.plot(ep, hist["val_loss"], label="validação")
+        ax.axvline(best_ep, ls="--", c="gray", label="melhor época")
+        ax.set_xlabel("época"); ax.set_ylabel("loss"); ax.set_title("Loss - " + name)
+        ax.legend(); ax.grid(alpha=.3); fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, name + "_loss.png"))
+    except Exception as e:                                # gráfico é opcional: não derruba o treino
+        print("[aviso] não foi possível salvar o gráfico de loss: %s" % e)
+
+
+def append_history_csv(result, cfg):
+    """
+    Acrescenta UMA linha por treino em resultados/historico_experimentos.csv
+    (hiperparâmetros + métricas). Diferente do .json, que é sobrescrito quando o mesmo
+    experimento é treinado de novo, este arquivo guarda TODAS as tentativas, servindo
+    para comparar os resultados intermediários do ajuste de hiperparâmetros no relatório.
+    """
+    m_val, m_te = result["metrics"]["mean"]["val"], result["metrics"]["mean"]["test"]
+    linha = {"data": time.strftime("%Y-%m-%d %H:%M"), "run": result["run"],
+             "epochs": cfg.epochs, "batch": cfg.batch_size, "lr": cfg.lr, "wd": cfg.weight_decay,
+             "loss": cfg.loss_mode, "aug_train": cfg.aug_train, "img": cfg.img_size,
+             "margem": cfg.slice_margin, "criterio": cfg.criterio, "ft_layer4": cfg.ft_layer4, "seed": cfg.seed,
+             "melhor_epoca": result["best_epoch"], "tempo_s": round(result["train_time_s"], 1),
+             "auc_val": round(m_val["auc"], 3), "auc_teste": round(m_te["auc"], 3),
+             "acc_teste": round(m_te["acc"], 3), "sens_teste": round(m_te["sens"], 3),
+             "espec_teste": round(m_te["spec"], 3), "f1_teste": round(m_te["f1"], 3)}
+    path = os.path.join(cfg.result_dir, "historico_experimentos.csv")
+    pd.DataFrame([linha]).to_csv(path, mode="a", index=False, header=not os.path.exists(path))
+
+
 def train_one(spec, cfg, bank, log=print, stop=None, on_epoch=None):
     """
     Treina um experimento e salva checkpoint + JSON de resultados.
     spec = (modelo, fase, modo_mascara). Retorna o dicionário de resultados.
     """
     model_name, phase, mask_mode = spec
-    name = run_name(spec)
+    name = run_name(spec, cfg.tag)
     os.makedirs(cfg.model_dir, exist_ok=True)
     os.makedirs(cfg.result_dir, exist_ok=True)
     seed_everything(cfg.seed)
@@ -730,7 +786,7 @@ def train_one(spec, cfg, bank, log=print, stop=None, on_epoch=None):
     val_pairs = make_pairs(rows_va, cfg.aug_val, np.random.RandomState(0))   # fixo em todas as épocas
 
     hist = {"train_loss": [], "val_loss": [], "val_auc": [], "lr": []}
-    best_loss, best_state, best_ep, bad = float("inf"), None, 0, 0
+    best_score, best_state, best_ep, bad = -float("inf"), None, 0, 0
     t0 = time.time()
 
     for ep in range(1, cfg.epochs + 1):
@@ -773,8 +829,13 @@ def train_one(spec, cfg, bank, log=print, stop=None, on_epoch=None):
             % (ep, cfg.epochs, tr_loss, va_loss, va_auc, opt.param_groups[0]["lr"], time.time() - t0))
         if on_epoch:
             on_epoch(name, hist)
-        if va_loss < best_loss - 1e-4:                        # guarda o melhor modelo (early stopping)
-            best_loss, best_ep, bad = va_loss, ep, 0
+        # Escolha da melhor época (early stopping). Com 'loss', a loss de validação subia desde a
+        # época 1 (o modelo fica "confiante demais" nos erros) e o modelo salvo era sempre o da
+        # 1ª época. Com 'auc', guarda-se a época que melhor ORDENA os pacientes da validação,
+        # que é o que importa para classificar pCR. Empate de AUC: desempata pela menor loss.
+        score = (va_auc - 1e-3 * va_loss) if cfg.criterio == "auc" and not np.isnan(va_auc) else -va_loss
+        if score > best_score:                                # guarda o melhor modelo (early stopping)
+            best_score, best_ep, bad = score, ep, 0
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         else:
             bad += 1
@@ -794,7 +855,7 @@ def train_one(spec, cfg, bank, log=print, stop=None, on_epoch=None):
         thr_dict[a] = thr
         metrics[a] = {"thr": thr, "val": binary_metrics(yv, pv[a], thr),
                       "test": binary_metrics(yt, pt[a], thr)}
-    result = {"run": name, "model": model_name, "phase": phase, "mask": mask_mode,
+    result = {"run": name, "model": model_name, "phase": phase, "mask": mask_mode, "tag": cfg.tag,
               "train_time_s": train_time, "best_epoch": best_ep, "epochs_run": len(hist["train_loss"]),
               "history": hist, "device": str(dev), "metrics": metrics,
               "test_patients": {"pids": pids_te, "y": yt.tolist(),
@@ -802,6 +863,8 @@ def train_one(spec, cfg, bank, log=print, stop=None, on_epoch=None):
               "cfg": {k: v for k, v in cfg.to_dict().items() if k not in ("data_dir", "csv_path")}}
     with open(os.path.join(cfg.result_dir, name + ".json"), "w", encoding="utf-8") as fh:
         json.dump(result, fh, indent=1)
+    save_loss_plot(name, hist, best_ep, cfg.result_dir)
+    append_history_csv(result, cfg)
     # checkpoint: pesos + configuração, para NÃO precisar retreinar na apresentação
     torch.save({"state": model.state_dict(), "spec": spec, "thr": thr_dict,
                 "cfg": cfg.to_dict()}, os.path.join(cfg.model_dir, name + ".pt"))
@@ -820,7 +883,7 @@ def run_experiments(specs, cfg, bank, log=print, stop=None, on_epoch=None):
         try:
             train_one(spec, cfg, bank, log, stop, on_epoch)
         except Exception:
-            log("ERRO em %s:\n%s" % (run_name(spec), traceback.format_exc()))
+            log("ERRO em %s:\n%s" % (run_name(spec, cfg.tag), traceback.format_exc()))
 
 
 def load_checkpoint(path, cfg=None):
@@ -836,6 +899,31 @@ def load_checkpoint(path, cfg=None):
     model = build_model(mname, in_ch, n_img, c)
     model.load_state_dict(ck["state"])
     return model.to(get_device()).eval(), ck
+
+
+def evaluate_saved(model, ck, bank, split=1):
+    """
+    Avalia um modelo JÁ TREINADO (checkpoint) nos pacientes da partição `split`
+    (1 = teste). Usado para o conjunto-teste surpresa: não treina nada, só prediz.
+    Retorna um texto com as métricas por agregação e a lista de previsões por paciente.
+    """
+    _, phase, mask_mode = ck["spec"]
+    rows = np.where(bank.split_row == split)[0]
+    if len(rows) == 0:
+        return "Nenhum paciente na partição de teste.", []
+    pids, y, p = patient_predictions(model, bank, rows, phase, mask_mode, get_device())
+    linhas = ["Pacientes avaliados: %d" % len(pids)]
+    if (y >= 0).all():                                     # só calcula métricas se houver rótulo
+        linhas.append("%-38s %5s %5s %5s %5s %5s %5s" % ("agregação", "acc", "sens", "espec", "prec", "F1", "AUC"))
+        for a in AGGS:
+            m = binary_metrics(y, p[a], ck["thr"][a])
+            linhas.append("%-38s %.3f %.3f %.3f %.3f %.3f %.3f" % (AGG_LABEL[a], m["acc"], m["sens"],
+                                                                  m["spec"], m["prec"], m["f1"], m["auc"]))
+    else:
+        linhas.append("CSV sem coluna pCR: apenas as previsões foram geradas.")
+    prev = [{"pid": pid, "pCR_real": int(yy), "prob_media": round(float(pp), 4),
+             "pred_media": int(pp >= ck["thr"]["mean"])} for pid, yy, pp in zip(pids, y, p["mean"])]
+    return "\n".join(linhas), prev
 
 
 def load_all_results(cfg):
@@ -1218,11 +1306,16 @@ if GUI_OK:
             self.cb_met = ttk.Combobox(top, state="readonly", width=8, values=["auc", "f1", "acc", "sens", "spec"])
             self.cb_met.set("auc"); self.cb_met.pack(side="left")
             self.cb_met.bind("<<ComboboxSelected>>", lambda e: self.refresh_results())
+            # rodada = máscara + tag: o gráfico e a hipótese comparam só experimentos da MESMA rodada
+            ttk.Label(top, text="Rodada (máscara | tag):").pack(side="left", padx=6)
+            self.cb_rod = ttk.Combobox(top, state="readonly", width=28); self.cb_rod.pack(side="left")
+            self.cb_rod.bind("<<ComboboxSelected>>", lambda e: self.refresh_results())
             ttk.Button(top, text="Atualizar", command=self.refresh_results).pack(side="left", padx=8)
-            cols = ("modelo", "entrada", "mascara", "limiar", "acc", "sens", "espec", "prec", "f1", "auc", "tempo(s)")
+            cols = ("experimento", "entrada", "mascara", "limiar", "acc", "sens", "espec", "prec", "f1", "auc", "tempo(s)")
             self.tree = ttk.Treeview(tab, columns=cols, show="headings", height=9)
             for c in cols:
-                self.tree.heading(c, text=c); self.tree.column(c, width=90, anchor="center")
+                self.tree.heading(c, text=c)
+                self.tree.column(c, width=200 if c == "experimento" else 80, anchor="center")
             self.tree.pack(fill="x")
             self.tree.bind("<<TreeviewSelect>>", self.on_select_result)
             body = ttk.Frame(tab); body.pack(fill="both", expand=True)
@@ -1244,13 +1337,18 @@ if GUI_OK:
             for r in res:
                 m = r["metrics"][agg]["test"]
                 iid = self.tree.insert("", "end", values=(
-                    r["model"], PHASE_LABEL[r["phase"]], r["mask"], "%.2f" % r["metrics"][agg]["thr"],
+                    r["run"], PHASE_LABEL[r["phase"]], r["mask"], "%.2f" % r["metrics"][agg]["thr"],
                     "%.3f" % m["acc"], "%.3f" % m["sens"], "%.3f" % m["spec"], "%.3f" % m["prec"],
                     "%.3f" % m["f1"], "%.3f" % m["auc"], "%.0f" % r["train_time_s"]))
                 self.res_rows[iid] = r
             # gráfico comparativo: barras por modelo, cor = entrada
             ax = self.cmp_ax[0][0]; ax.clear()
-            sel = [r for r in res if r["mask"] == (res[0]["mask"] if res else "none")]
+            rodada = lambda r: "%s | %s" % (r["mask"], r.get("tag", "") or "-")
+            rodadas = sorted(set(rodada(r) for r in res))
+            self.cb_rod["values"] = rodadas
+            if rodadas and self.cb_rod.get() not in rodadas:
+                self.cb_rod.set(rodadas[0])
+            sel = [r for r in res if rodada(r) == self.cb_rod.get()]
             models_ = [m for m in MODELS if any(r["model"] == m for r in sel)]
             w = 0.2
             for j, ph in enumerate(PHASES):
@@ -1290,12 +1388,16 @@ if GUI_OK:
             thr = r["metrics"][agg]["thr"]
             fp = [p for p, y, v in zip(tp["pids"], tp["y"], tp["p"][agg]) if y == 0 and v >= thr]
             fn = [p for p, y, v in zip(tp["pids"], tp["y"], tp["p"][agg]) if y == 1 and v < thr]
+            vp = [p for p, y, v in zip(tp["pids"], tp["y"], tp["p"][agg]) if y == 1 and v >= thr]
+            vn = [p for p, y, v in zip(tp["pids"], tp["y"], tp["p"][agg]) if y == 0 and v < thr]
             self.txt_res.delete("1.0", "end")
             self.txt_res.insert("end", "%s | agregação: %s | limiar %.2f\nMatriz de confusão (teste): VP=%d VN=%d FP=%d FN=%d\n"
                                 "Falsos positivos (previu pCR, não ocorreu): %s\nFalsos negativos (pCR não detectado): %s\n"
+                                "Acertos pCR presente (VP): %s\nAcertos pCR ausente (VN, até 10): %s\n"
                                 "Tempo de treino: %.0fs | melhor época: %d | épocas executadas: %d"
                                 % (r["run"], AGG_LABEL[agg], thr, m["tp"], m["tn"], m["fp"], m["fn"],
-                                   ", ".join(fp) or "-", ", ".join(fn) or "-", r["train_time_s"],
+                                   ", ".join(fp) or "-", ", ".join(fn) or "-", ", ".join(vp) or "-",
+                                   ", ".join(vn[:10]) or "-", r["train_time_s"],
                                    r["best_epoch"], r["epochs_run"]))
 
         # ------------------------- ABA 4: CLASSIFICAR + GRAD-CAM (e) -------------------------
@@ -1311,6 +1413,7 @@ if GUI_OK:
             self.cb_cagg.set(AGG_LABEL["mean"]); self.cb_cagg.pack(side="left", padx=4)
             ttk.Button(top, text="Classificar", command=self.classify).pack(side="left", padx=6)
             ttk.Button(top, text="Sobreposição Grad-CAM x tumor (teste)", command=self.cam_overlap_test).pack(side="left")
+            ttk.Button(top, text="Avaliar no conjunto de teste", command=self.evaluate_test).pack(side="left", padx=6)
             self.lbl_cls = ttk.Label(tab, text="", font=("TkDefaultFont", 11, "bold")); self.lbl_cls.pack(fill="x")
             self.cls_z = tk.Scale(tab, from_=0, to=1, orient="horizontal", label="Corte (índice dentro da faixa tumoral)",
                                   command=lambda v: self.cls_draw())
@@ -1374,6 +1477,22 @@ if GUI_OK:
                 a.axis("off")
             self.cls_fig.tight_layout(); self.cls_cv.draw_idle()
 
+        def evaluate_test(self):
+            # Avalia o modelo salvo nos pacientes de teste do dataset carregado. Para o teste
+            # surpresa: carregue a pasta/CSV novos (sem coluna 'test' = todos viram teste) e clique aqui.
+            if self.bank is None or not self.cb_run.get():
+                return messagebox.showinfo("Aviso", "Carregue o dataset e selecione um modelo.")
+            model, ck = load_checkpoint(os.path.join(self.cfg.model_dir, self.cb_run.get() + ".pt"))
+            if ck["cfg"]["img_size"] != self.cfg.img_size:
+                return messagebox.showerror("Erro", "O modelo foi treinado com imagens de %d px; recarregue o "
+                                            "dataset com esse tamanho." % ck["cfg"]["img_size"])
+            texto, prev = evaluate_saved(model, ck, self.bank)
+            erros = [d["pid"] for d in prev if d["pCR_real"] >= 0 and d["pred_media"] != d["pCR_real"]]
+            win = tk.Toplevel(self); win.title("Avaliação - " + self.cb_run.get())
+            txt = scrolledtext.ScrolledText(win, width=95, height=20, font=("Courier", 10))
+            txt.pack(fill="both", expand=True)
+            txt.insert("end", texto + "\n\nErros (agregação média): " + (", ".join(erros) or "-"))
+
         def cam_overlap_test(self):
             # Quantifica, em todos os cortes de teste, quanto do Grad-CAM cai sobre o tumor.
             if self.bank is None or not self.cb_run.get():
@@ -1405,6 +1524,13 @@ def headless_train(args):
     cfg.data_dir, cfg.csv_path, cfg.img_size = args.data_dir, args.csv, args.img_size
     if args.epochs:
         cfg.epochs = args.epochs
+    # hiperparâmetros opcionais (se não forem passados, ficam os valores padrão da classe Config)
+    for arg, attr in (("lr", "lr"), ("weight_decay", "weight_decay"), ("batch_size", "batch_size"),
+                      ("patience", "patience"), ("slice_margin", "slice_margin"), ("loss", "loss_mode"),
+                      ("criterio", "criterio"), ("seed", "seed")):
+        if getattr(args, arg) is not None:
+            setattr(cfg, attr, getattr(args, arg))
+    cfg.ft_layer4, cfg.tag = args.ft_layer4, args.tag
     cfg.csv_path = find_csv(cfg)
     if not cfg.csv_path:
         sys.exit("CSV não encontrado em '%s'. Use --csv." % cfg.data_dir)
@@ -1419,6 +1545,25 @@ def headless_train(args):
     phases_ = [p for p in args.phases.split(",") if p in PHASES] if args.phases else list(PHASES)
     specs = [(m, p, args.mask) for m in models_ for p in phases_]
     run_experiments(specs, cfg, bank)
+
+
+def headless_evaluate(args):
+    # --avaliar: avalia um modelo salvo num dataset/CSV (ex.: conjunto-teste surpresa), sem treinar.
+    model, ck = load_checkpoint(args.avaliar)
+    cfg = Config()
+    cfg.data_dir, cfg.csv_path = args.data_dir, args.csv
+    cfg.img_size = ck["cfg"]["img_size"]               # mesmo tamanho usado no treino do modelo
+    cfg.csv_path = find_csv(cfg)
+    if not cfg.csv_path:
+        sys.exit("CSV não encontrado em '%s'. Use --csv." % cfg.data_dir)
+    meta = read_meta(cfg.csv_path)
+    bank = build_bank(meta, index_dataset(cfg.data_dir, list(meta["pid"])), cfg)
+    texto, prev = evaluate_saved(model, ck, bank)
+    print("\nModelo: %s\n%s" % (os.path.basename(args.avaliar), texto))
+    os.makedirs(cfg.result_dir, exist_ok=True)
+    saida = os.path.join(cfg.result_dir, "previsoes_" + os.path.basename(args.avaliar)[:-3] + ".csv")
+    pd.DataFrame(prev).to_csv(saida, index=False)
+    print("Previsões por paciente salvas em:", saida)
 
 
 def selftest():
@@ -1451,6 +1596,9 @@ def selftest():
     x = make_input(bank.X[:2].float().to(get_device()), "all", "none")
     cam, pr = grad_cam(model, x)
     print("Grad-CAM:", cam.shape, "prob:", pr)
+    texto, _ = evaluate_saved(model, ck, bank)
+    print(texto)
+    assert os.path.exists(os.path.join(cfg.result_dir, "historico_experimentos.csv"))
     print("SELFTEST OK")
 
 
@@ -1467,9 +1615,23 @@ def main():
     ap.add_argument("--aug-val", type=int, default=0, help="variações por corte na validação (1-10)")
     ap.add_argument("--models", default="", help="ex.: cnn,resnet50,novel")
     ap.add_argument("--phases", default="", help="ex.: pre,early,late,all")
+    ap.add_argument("--avaliar", default="", help="caminho de um modelo .pt para avaliar no CSV/pasta dados")
+    # ajuste de hiperparâmetros pelo terminal (padrão = valores da classe Config)
+    ap.add_argument("--lr", type=float, default=None, help="learning rate (padrão 1e-3)")
+    ap.add_argument("--weight-decay", type=float, default=None, help="regularização L2 (padrão 1e-4)")
+    ap.add_argument("--batch-size", type=int, default=None, help="tamanho do lote (padrão 32)")
+    ap.add_argument("--patience", type=int, default=None, help="épocas sem melhora até parar (padrão 7)")
+    ap.add_argument("--slice-margin", type=int, default=None, help="cortes extras fora do tumor (padrão 1)")
+    ap.add_argument("--loss", default=None, choices=["pos_weight", "focal", "none"])
+    ap.add_argument("--criterio", default=None, choices=["auc", "loss"], help="escolha da melhor época (padrão auc)")
+    ap.add_argument("--seed", type=int, default=None, help="semente aleatória (padrão 42)")
+    ap.add_argument("--ft-layer4", action="store_true", help="ResNet50: também ajusta o layer4")
+    ap.add_argument("--tag", default="", help="sufixo no nome dos resultados (não sobrescreve rodadas)")
     args = ap.parse_args()
     if args.selftest:
         return selftest()
+    if args.avaliar:
+        return headless_evaluate(args)
     if args.train_all:
         return headless_train(args)
     if not GUI_OK:
