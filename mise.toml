@@ -1,0 +1,33 @@
+# Ambiente do trabalho (mise): Python + ambiente virtual em .venv
+#   mise install         -> baixa Python e uv
+#   mise run install     -> instala as bibliotecas no .venv
+#   mise run selftest    -> teste rápido com dados sintéticos
+#   mise run gui         -> abre a interface gráfica
+#   mise run train       -> treina os 12 experimentos sem interface
+
+[tools]
+python = "3.12"
+uv = "latest"
+
+[env]
+_.python.venv = { path = ".venv", create = true }
+
+[tasks.install]
+description = "Instala as bibliotecas no .venv (PyTorch versão CPU)"
+# Para usar GPU NVIDIA, troque o índice "cpu" pelo da sua versão de CUDA (veja pytorch.org).
+run = [
+  "uv pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision",
+  "uv pip install nibabel numpy pandas pillow matplotlib",
+]
+
+[tasks.selftest]
+description = "Teste rápido com dados sintéticos"
+run = "python trabalho_pcr_dce_mri.py --selftest"
+
+[tasks.gui]
+description = "Abre a interface gráfica"
+run = "python trabalho_pcr_dce_mri.py"
+
+[tasks.train]
+description = "Treina os 12 experimentos sem interface (aceita argumentos extras)"
+run = "python trabalho_pcr_dce_mri.py --train-all"

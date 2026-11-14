@@ -70,6 +70,9 @@ class Config:
     # --- pré-processamento ---
     img_size = 128        # lado (px) após redimensionar; 128 = bom custo/benefício
     slice_margin = 1      # cortes extras acima/abaixo do tumor usados no treino
+    roi = False           # True = recorta um quadrado em torno do tumor antes de redimensionar
+    roi_pad = 0.25        # folga do recorte: fração do lado da caixa do tumor acrescida de cada lado
+    roi_min = 48          # lado mínimo (px) do recorte, para tumores muito pequenos
     # --- treinamento ---
     epochs = 25
     batch_size = 32
@@ -84,6 +87,8 @@ class Config:
     loss_mode = "pos_weight"   # 'pos_weight' | 'focal' | 'none'
     focal_gamma = 2.0
     ft_layer4 = False     # ResNet50: também ajusta o layer4 (False = só a parte FC)
+    novel_freeze = 1      # rede nova: congela a ResNet18 até o layerN (1 = stem+layer1 ... 3 = até o layer3)
+    pat_balance = False   # True = cada paciente contribui com o mesmo nº de cortes por época
     pretrained = True     # usa pesos ImageNet (precisa de internet na 1ª vez)
     seed = 42
 
@@ -115,6 +120,9 @@ PHASE_LABEL = {"pre": "pré-contraste", "early": "pós-precoce",
 MODELS = {"cnn": "CNN própria (5 conv)", "resnet50": "ResNet50 (ImageNet)",
           "novel": "Nova: ResNet18 + atenção entre fases"}
 MASK_MODES = ["none", "channel", "apply"]
+# Hiperparâmetros que definem o banco de cortes: um modelo só pode ser avaliado em dados
+# pré-processados da mesma forma que os do seu treino.
+PREPROC_KEYS = ("img_size", "slice_margin", "roi", "roi_pad", "roi_min")
 
 # Aumento de dados: (ângulo em graus, espelhado?) -> 5 x 2 = 10 variações
 VARIANTS = [(a, f) for f in (0, 1) for a in (-20, -10, 0, 10, 20)]
@@ -244,13 +252,37 @@ class Bank:
     pass
 
 
-def preprocess_patient(paths, mask_path, row, S, margin):
+def roi_box(mask, pad, min_side):
+    """
+    Quadrado (r0, r1, c0, c1) em torno do tumor, igual para todos os cortes do paciente:
+    caixa envolvente da máscara no plano xy (projeção de todos os cortes), com lado
+    max(altura, largura) * (1 + 2*pad), no mínimo min_side px, sem sair da imagem.
+    Retorna None se a máscara for vazia (aí usa-se a imagem inteira).
+    """
+    H, W = mask.shape[:2]
+    rr = np.where(mask.any(axis=(1, 2)))[0]
+    cc = np.where(mask.any(axis=(0, 2)))[0]
+    if len(rr) == 0:
+        return None
+    lado = max(rr.max() - rr.min() + 1, cc.max() - cc.min() + 1) * (1 + 2 * pad)
+    lado = int(min(max(round(lado), min_side), H, W))
+    r0 = int(round((rr.min() + rr.max() + 1) / 2 - lado / 2))
+    c0 = int(round((cc.min() + cc.max() + 1) / 2 - lado / 2))
+    r0, c0 = min(max(r0, 0), H - lado), min(max(c0, 0), W - lado)
+    return r0, r0 + lado, c0, c0 + lado
+
+
+def preprocess_patient(paths, mask_path, row, S, margin, log=None, roi=None):
     # carrega as 3 fases + máscara, normaliza, seleciona cortes tumorais e redimensiona.
+    # roi = (folga, lado_mínimo) recorta em torno do tumor antes de redimensionar; None = imagem inteira.
     vols = [load_volume(p) for p in paths]
     shape = vols[0].shape
     if mask_path is not None:
         mask = load_volume(mask_path) > 0
         if mask.shape != shape:                      # segurança: formato diferente
+            if log is not None:
+                log("  [aviso] %s: máscara com formato %s diferente da imagem %s; máscara ignorada"
+                    % (row.get("pid", "?"), tuple(mask.shape), tuple(shape)))
             mask = np.zeros(shape, bool)
     else:
         mask = np.zeros(shape, bool)
@@ -271,6 +303,17 @@ def preprocess_patient(paths, mask_path, row, S, margin):
     z0, z1 = max(int(zs.min()) - margin, 0), min(int(zs.max()) + margin, Z - 1)
     zsel = np.arange(z0, z1 + 1)
 
+    # Recorte em torno do tumor (opcional): o tumor ocupa ~9% da imagem (mediana); recortando,
+    # ele passa a preencher a entrada da rede em vez de ser reduzido junto com o fundo.
+    if roi is not None:
+        box = roi_box(mask, roi[0], roi[1])
+        if box is None:
+            if log is not None:
+                log("  [aviso] %s: máscara vazia, recorte não aplicado (imagem inteira)" % row.get("pid", "?"))
+        else:
+            r0, r1, c0, c1 = box
+            stack, mask = stack[:, r0:r1, c0:c1], mask[r0:r1, c0:c1]
+
     # (Zs, 3, X, Y) -> redimensiona para (S, S)
     t = torch.from_numpy(stack[:, :, :, zsel]).permute(3, 0, 1, 2).contiguous()
     m = torch.from_numpy(mask[:, :, zsel].astype(np.float32)).permute(2, 0, 1)[:, None]
@@ -286,15 +329,22 @@ def build_bank(meta, index, cfg, log=print):
     os.makedirs(cfg.cache_dir, exist_ok=True)
     # o nome do cache inclui o CSV: assim o dataset de treino e um conjunto novo não se sobrescrevem
     csv_name = os.path.splitext(os.path.basename(cfg.csv_path or "dados"))[0]
-    cache = os.path.join(cfg.cache_dir, "bank_%s_s%d_m%d.pt" % (csv_name, cfg.img_size, cfg.slice_margin))
+    roi = (cfg.roi_pad, cfg.roi_min) if cfg.roi else None
+    cache = os.path.join(cfg.cache_dir, "bank_%s_s%d_m%d%s.pt" % (
+        csv_name, cfg.img_size, cfg.slice_margin,
+        "_roi%d_%d" % (round(100 * cfg.roi_pad), cfg.roi_min) if cfg.roi else ""))
+    csv_pids = [str(p) for p in meta["pid"]]
     if os.path.exists(cache):
         try:
             d = torch.load(cache, weights_only=False)
-            if set(d["pids"]) <= set(meta["pid"]):                     # mesmos pacientes do CSV
+            # só reaproveita se a lista de pacientes do CSV for IDÊNTICA à de quando o cache foi
+            # gerado (caches antigos, sem 'csv_pids', são refeitos)
+            if d.get("csv_pids") == csv_pids:
                 log("Cache de pré-processamento carregado: " + cache)
                 b = Bank()
                 b.__dict__.update(d)
                 return b
+            log("Cache desatualizado (pacientes do CSV mudaram), refazendo...")
         except Exception as e:
             log("Cache inválido, refazendo (%s)" % e)
 
@@ -307,7 +357,7 @@ def build_bank(meta, index, cfg, log=print):
         if paths is None:
             log("  [aviso] %s sem as 3 fases, ignorado" % pid)
             continue
-        x4, area, zsel = preprocess_patient(paths, info["mask"], row, cfg.img_size, cfg.slice_margin)
+        x4, area, zsel = preprocess_patient(paths, info["mask"], row, cfg.img_size, cfg.slice_margin, log, roi)
         k = len(pids)
         pids.append(pid)
         y_pat.append(int(row["pCR"]))
@@ -329,6 +379,7 @@ def build_bank(meta, index, cfg, log=print):
     b.area = np.array(area_row, np.float32)
     b.z_row = np.array(z_row, np.int64)
     b.pids, b.y_pat, b.split_pat = pids, np.array(y_pat), np.array(split_pat)
+    b.csv_pids = csv_pids
     torch.save(b.__dict__, cache)
     log("Banco: %d pacientes, %d cortes (cache salvo)." % (len(pids), b.X.shape[0]))
     return b
@@ -387,6 +438,18 @@ def make_pairs(rows, k, rng):
         v = np.stack([rng.permutation(len(VARIANTS))[:k] for _ in rows])
     r = np.repeat(rows[:, None], v.shape[1], axis=1)
     return np.stack([r.ravel(), v.ravel()], 1)
+
+
+def balanced_rows(bank, rows, rng):
+    """
+    Amostragem equilibrada por paciente: sorteia, para cada paciente, o MESMO número de
+    cortes (a mediana de cortes por paciente). Sem isso, pacientes com tumor grande
+    (mais cortes) pesam mais na loss. Quem tem menos cortes é sorteado com reposição.
+    """
+    prow = bank.pid_row[rows]
+    grupos = [rows[prow == p] for p in np.unique(prow)]
+    k = int(np.median([len(g) for g in grupos]))
+    return np.concatenate([rng.choice(g, k, replace=len(g) < k) for g in grupos])
 
 
 def channels_for(phase, mask_mode):
@@ -526,13 +589,16 @@ class PhaseAttnNet(nn.Module):
     Vantagem: ramos independentes por fase (sugestão do enunciado) com poucos
     parâmetros (tronco compartilhado) e atenção interpretável sobre qual fase pesa mais.
     """
-    def __init__(self, in_ch, n_img_ch, pretrained=True):
+    def __init__(self, in_ch, n_img_ch, pretrained=True, freeze=1):
         super().__init__()
         trunk, ok = _load_resnet(models.resnet18, models.ResNet18_Weights.IMAGENET1K_V1, pretrained)
         _adapt_conv1(trunk, 1)
         trunk.fc = nn.Identity()
         if ok:                                            # congela filtros de baixo nível
-            for mod in (trunk.conv1, trunk.bn1, trunk.layer1):
+            # freeze = 1: stem + layer1 | 2: + layer2 | 3: + layer3 (só layer4, atenção e cabeça treinam).
+            # Congelar mais reduz os parâmetros treináveis e o overfitting (há só ~100 pacientes de treino).
+            congelar = [trunk.conv1, trunk.bn1] + [trunk.layer1, trunk.layer2, trunk.layer3][:max(freeze, 1)]
+            for mod in congelar:
                 for p in mod.parameters():
                     p.requires_grad = False
         self.trunk, self.n_img = trunk, n_img_ch
@@ -568,7 +634,7 @@ def build_model(name, in_ch, n_img, cfg):
     if name == "resnet50":
         return ResNet50Cls(in_ch, cfg.pretrained, cfg.ft_layer4)
     if name == "novel":
-        return PhaseAttnNet(in_ch, n_img, cfg.pretrained)
+        return PhaseAttnNet(in_ch, n_img, cfg.pretrained, cfg.novel_freeze)
     raise ValueError(name)
 
 
@@ -775,13 +841,22 @@ def train_one(spec, cfg, bank, log=print, stop=None, on_epoch=None):
     rows_tr = np.where(bank.split_row == 0)[0]
     rows_va = np.where(bank.split_row == 2)[0]
     rows_te = np.where(bank.split_row == 1)[0]
-    pos = float(bank.y_row[rows_tr].sum())
-    neg = len(rows_tr) - pos
+    if cfg.pat_balance:                                       # proporção contada por paciente
+        y_tr = bank.y_pat[bank.split_pat == 0]
+        pos = float((y_tr == 1).sum())
+        neg = float(len(y_tr)) - pos
+    else:                                                     # proporção contada por corte
+        pos = float(bank.y_row[rows_tr].sum())
+        neg = len(rows_tr) - pos
     loss_fn = make_loss(cfg.loss_mode, neg / max(pos, 1), cfg.focal_gamma, neg / (pos + neg), dev)
 
     opt = torch.optim.AdamW(param_groups(model, cfg.lr, cfg.backbone_lr_factor),
                             weight_decay=cfg.weight_decay)
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=2)
+    # o scheduler acompanha a MESMA grandeza usada para escolher a melhor época:
+    # AUC de validação (quanto maior, melhor) ou loss de validação (quanto menor, melhor)
+    sched_auc = cfg.criterio == "auc"
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max" if sched_auc else "min",
+                                                       factor=0.5, patience=2)
     rng = np.random.RandomState(cfg.seed)
     val_pairs = make_pairs(rows_va, cfg.aug_val, np.random.RandomState(0))   # fixo em todas as épocas
 
@@ -794,7 +869,8 @@ def train_one(spec, cfg, bank, log=print, stop=None, on_epoch=None):
             log("Treinamento interrompido pelo usuário.")
             break
         model.train()                                         # ativa dropout/BN (exceto partes congeladas)
-        pairs = make_pairs(rows_tr, cfg.aug_train, rng)
+        rows_ep = balanced_rows(bank, rows_tr, rng) if cfg.pat_balance else rows_tr
+        pairs = make_pairs(rows_ep, cfg.aug_train, rng)
         rng.shuffle(pairs)
         tot, n = 0.0, 0
         n_batches = math.ceil(len(pairs) / cfg.batch_size)
@@ -822,7 +898,10 @@ def train_one(spec, cfg, bank, log=print, stop=None, on_epoch=None):
         va_loss = eval_loss(model, bank, val_pairs, spec, loss_fn, cfg, dev)
         _, yv, pv = patient_predictions(model, bank, rows_va, phase, mask_mode, dev)
         va_auc = auc_score(yv, pv["mean"])
-        sched.step(va_loss)
+        if not sched_auc:
+            sched.step(va_loss)
+        elif not np.isnan(va_auc):                            # AUC indefinida (validação com 1 classe): não ajusta
+            sched.step(va_auc)
         hist["train_loss"].append(tr_loss); hist["val_loss"].append(va_loss)
         hist["val_auc"].append(va_auc); hist["lr"].append(opt.param_groups[0]["lr"])
         log("ép %02d/%d | loss treino %.4f | loss val %.4f | AUC val (média) %.3f | lr %.1e | %.0fs"
@@ -901,18 +980,26 @@ def load_checkpoint(path, cfg=None):
     return model.to(get_device()).eval(), ck
 
 
-def evaluate_saved(model, ck, bank, split=1):
+def evaluate_saved(modelos, bank, split=1):
     """
-    Avalia um modelo JÁ TREINADO (checkpoint) nos pacientes da partição `split`
-    (1 = teste). Usado para o conjunto-teste surpresa: não treina nada, só prediz.
+    Avalia modelos JÁ TREINADOS nos pacientes da partição `split` (1 = teste). Usado para
+    o conjunto-teste surpresa: não treina nada, só prediz.
+    modelos = lista de (modelo, checkpoint). Com mais de um, faz um COMITÊ: a probabilidade
+    de cada paciente é a média das probabilidades dos modelos, e o limiar é a média dos
+    limiares. A média reduz a variação entre treinos (sementes), que é grande com poucos dados.
     Retorna um texto com as métricas por agregação e a lista de previsões por paciente.
     """
-    _, phase, mask_mode = ck["spec"]
     rows = np.where(bank.split_row == split)[0]
     if len(rows) == 0:
         return "Nenhum paciente na partição de teste.", []
-    pids, y, p = patient_predictions(model, bank, rows, phase, mask_mode, get_device())
-    linhas = ["Pacientes avaliados: %d" % len(pids)]
+    soma = None
+    for model, ck_i in modelos:
+        _, phase, mask_mode = ck_i["spec"]
+        pids, y, p_i = patient_predictions(model, bank, rows, phase, mask_mode, get_device())
+        soma = p_i if soma is None else {a: soma[a] + p_i[a] for a in AGGS}
+    p = {a: soma[a] / len(modelos) for a in AGGS}
+    ck = {"thr": {a: float(np.mean([c["thr"][a] for _, c in modelos])) for a in AGGS}}
+    linhas = ["Pacientes avaliados: %d | modelos no comitê: %d" % (len(pids), len(modelos))]
     if (y >= 0).all():                                     # só calcula métricas se houver rótulo
         linhas.append("%-38s %5s %5s %5s %5s %5s %5s" % ("agregação", "acc", "sens", "espec", "prec", "F1", "AUC"))
         for a in AGGS:
@@ -1045,9 +1132,14 @@ if GUI_OK:
                        ).grid(row=1, column=2)
             ttk.Label(f, text="Tamanho (px):").grid(row=0, column=3, padx=6)
             ttk.Entry(f, textvariable=self.v_size, width=6).grid(row=0, column=4)
-            ttk.Button(f, text="Carregar dataset", command=self.load_dataset).grid(row=0, column=5, padx=8)
+            self.v_margin = tk.StringVar(value=str(self.cfg.slice_margin))
+            ttk.Label(f, text="Margem (cortes):").grid(row=0, column=5, padx=6)
+            ttk.Entry(f, textvariable=self.v_margin, width=4).grid(row=0, column=6)
+            self.v_roi = tk.BooleanVar(value=self.cfg.roi)
+            ttk.Checkbutton(f, text="Recortar tumor", variable=self.v_roi).grid(row=0, column=7, padx=6)
+            ttk.Button(f, text="Carregar dataset", command=self.load_dataset).grid(row=0, column=8, padx=8)
             self.lbl_status = ttk.Label(f, text="Dataset não carregado.")
-            self.lbl_status.grid(row=1, column=3, columnspan=3, sticky="w", padx=6)
+            self.lbl_status.grid(row=1, column=3, columnspan=6, sticky="w", padx=6)
 
         def load_dataset(self):
             # Indexa arquivos e constrói o banco de cortes (em thread, para não travar a GUI).
@@ -1059,8 +1151,10 @@ if GUI_OK:
             self.v_csv.set(csv)
             try:
                 self.cfg.img_size = int(self.v_size.get())
+                self.cfg.slice_margin = max(int(self.v_margin.get()), 0)
+                self.cfg.roi = self.v_roi.get()
             except ValueError:
-                return messagebox.showerror("Erro", "Tamanho inválido.")
+                return messagebox.showerror("Erro", "Tamanho ou margem inválidos.")
             self.lbl_status.config(text="Carregando... (pode levar alguns minutos na 1ª vez)")
 
             def work():
@@ -1242,6 +1336,12 @@ if GUI_OK:
             self.v_pre = tk.BooleanVar(value=True); self.v_ft4 = tk.BooleanVar(value=False)
             ttk.Checkbutton(left, text="Usar pesos ImageNet", variable=self.v_pre).pack(anchor="w")
             ttk.Checkbutton(left, text="ResNet50: ajustar também o layer4", variable=self.v_ft4).pack(anchor="w")
+            self.v_bal = tk.BooleanVar(value=self.cfg.pat_balance)
+            ttk.Checkbutton(left, text="Mesmo nº de cortes por paciente", variable=self.v_bal).pack(anchor="w")
+            r = ttk.Frame(left); r.pack(fill="x", pady=2)
+            ttk.Label(r, text="Rede nova: congelar até o layer", width=32).pack(side="left")
+            self.v_frz = tk.StringVar(value=str(self.cfg.novel_freeze))
+            ttk.Combobox(r, textvariable=self.v_frz, width=10, state="readonly", values=["1", "2", "3"]).pack(side="left")
             ttk.Label(left, text="\nModelos:").pack(anchor="w")
             self.v_models = {m: tk.BooleanVar(value=True) for m in MODELS}
             for m, v in self.v_models.items():
@@ -1266,6 +1366,7 @@ if GUI_OK:
             c.aug_train = min(max(c.aug_train, 1), 10); c.aug_val = min(max(c.aug_val, 1), 10)
             c.lr, c.weight_decay = float(self.pv["lr"].get()), float(self.pv["weight_decay"].get())
             c.loss_mode, c.pretrained, c.ft_layer4 = self.pv["loss_mode"].get(), self.v_pre.get(), self.v_ft4.get()
+            c.pat_balance, c.novel_freeze = self.v_bal.get(), int(self.v_frz.get())
 
         def start_training(self):
             if self.bank is None:
@@ -1486,7 +1587,13 @@ if GUI_OK:
             if ck["cfg"]["img_size"] != self.cfg.img_size:
                 return messagebox.showerror("Erro", "O modelo foi treinado com imagens de %d px; recarregue o "
                                             "dataset com esse tamanho." % ck["cfg"]["img_size"])
-            texto, prev = evaluate_saved(model, ck, self.bank)
+            if ck["cfg"].get("slice_margin", self.cfg.slice_margin) != self.cfg.slice_margin:
+                return messagebox.showerror("Erro", "O modelo foi treinado com margem de %d corte(s); recarregue o "
+                                            "dataset com essa margem." % ck["cfg"]["slice_margin"])
+            if ck["cfg"].get("roi", False) != self.cfg.roi:
+                return messagebox.showerror("Erro", "O modelo foi treinado %s o recorte do tumor; recarregue o dataset "
+                                            "com a mesma opção." % ("COM" if ck["cfg"].get("roi", False) else "SEM"))
+            texto, prev = evaluate_saved([(model, ck)], self.bank)
             erros = [d["pid"] for d in prev if d["pCR_real"] >= 0 and d["pred_media"] != d["pCR_real"]]
             win = tk.Toplevel(self); win.title("Avaliação - " + self.cb_run.get())
             txt = scrolledtext.ScrolledText(win, width=95, height=20, font=("Courier", 10))
@@ -1531,6 +1638,9 @@ def headless_train(args):
         if getattr(args, arg) is not None:
             setattr(cfg, attr, getattr(args, arg))
     cfg.ft_layer4, cfg.tag = args.ft_layer4, args.tag
+    cfg.roi, cfg.pat_balance = args.roi, args.pat_balance
+    if args.novel_freeze is not None:
+        cfg.novel_freeze = args.novel_freeze
     cfg.csv_path = find_csv(cfg)
     if not cfg.csv_path:
         sys.exit("CSV não encontrado em '%s'. Use --csv." % cfg.data_dir)
@@ -1549,19 +1659,28 @@ def headless_train(args):
 
 def headless_evaluate(args):
     # --avaliar: avalia um modelo salvo num dataset/CSV (ex.: conjunto-teste surpresa), sem treinar.
-    model, ck = load_checkpoint(args.avaliar)
+    # aceita vários modelos separados por vírgula: as previsões são combinadas por média (comitê)
+    caminhos = [c.strip() for c in args.avaliar.split(",") if c.strip()]
+    modelos = [load_checkpoint(c) for c in caminhos]
+    ck = modelos[0][1]
     cfg = Config()
     cfg.data_dir, cfg.csv_path = args.data_dir, args.csv
-    cfg.img_size = ck["cfg"]["img_size"]               # mesmo tamanho usado no treino do modelo
+    # o pré-processamento tem de ser o mesmo do treino: tamanho, margem de cortes e recorte do tumor
+    for k in PREPROC_KEYS:
+        setattr(cfg, k, ck["cfg"].get(k, getattr(cfg, k)))
+        if any(c["cfg"].get(k, getattr(Config, k)) != getattr(cfg, k) for _, c in modelos):
+            sys.exit("Os modelos do comitê usam pré-processamento diferente (%s); avalie-os separadamente." % k)
     cfg.csv_path = find_csv(cfg)
     if not cfg.csv_path:
         sys.exit("CSV não encontrado em '%s'. Use --csv." % cfg.data_dir)
     meta = read_meta(cfg.csv_path)
     bank = build_bank(meta, index_dataset(cfg.data_dir, list(meta["pid"])), cfg)
-    texto, prev = evaluate_saved(model, ck, bank)
-    print("\nModelo: %s\n%s" % (os.path.basename(args.avaliar), texto))
+    texto, prev = evaluate_saved(modelos, bank)
+    nomes = [os.path.basename(c)[:-3] for c in caminhos]
+    print("\nModelo(s): %s\n%s" % (", ".join(nomes), texto))
     os.makedirs(cfg.result_dir, exist_ok=True)
-    saida = os.path.join(cfg.result_dir, "previsoes_" + os.path.basename(args.avaliar)[:-3] + ".csv")
+    nome_saida = nomes[0] if len(nomes) == 1 else "comite_%d_%s" % (len(nomes), nomes[0])
+    saida = os.path.join(cfg.result_dir, "previsoes_" + nome_saida + ".csv")
     pd.DataFrame(prev).to_csv(saida, index=False)
     print("Previsões por paciente salvas em:", saida)
 
@@ -1596,7 +1715,7 @@ def selftest():
     x = make_input(bank.X[:2].float().to(get_device()), "all", "none")
     cam, pr = grad_cam(model, x)
     print("Grad-CAM:", cam.shape, "prob:", pr)
-    texto, _ = evaluate_saved(model, ck, bank)
+    texto, _ = evaluate_saved([(model, ck)], bank)
     print(texto)
     assert os.path.exists(os.path.join(cfg.result_dir, "historico_experimentos.csv"))
     print("SELFTEST OK")
@@ -1615,7 +1734,8 @@ def main():
     ap.add_argument("--aug-val", type=int, default=0, help="variações por corte na validação (1-10)")
     ap.add_argument("--models", default="", help="ex.: cnn,resnet50,novel")
     ap.add_argument("--phases", default="", help="ex.: pre,early,late,all")
-    ap.add_argument("--avaliar", default="", help="caminho de um modelo .pt para avaliar no CSV/pasta dados")
+    ap.add_argument("--avaliar", default="", help="modelo .pt para avaliar no CSV/pasta de dados; vários "
+                                                  "separados por vírgula = comitê (média das previsões)")
     # ajuste de hiperparâmetros pelo terminal (padrão = valores da classe Config)
     ap.add_argument("--lr", type=float, default=None, help="learning rate (padrão 1e-3)")
     ap.add_argument("--weight-decay", type=float, default=None, help="regularização L2 (padrão 1e-4)")
@@ -1626,6 +1746,10 @@ def main():
     ap.add_argument("--criterio", default=None, choices=["auc", "loss"], help="escolha da melhor época (padrão auc)")
     ap.add_argument("--seed", type=int, default=None, help="semente aleatória (padrão 42)")
     ap.add_argument("--ft-layer4", action="store_true", help="ResNet50: também ajusta o layer4")
+    ap.add_argument("--roi", action="store_true", help="recorta a imagem em torno do tumor antes de redimensionar")
+    ap.add_argument("--pat-balance", action="store_true", help="mesmo nº de cortes por paciente em cada época")
+    ap.add_argument("--novel-freeze", type=int, default=None, choices=[1, 2, 3],
+                    help="rede nova: congela a ResNet18 até o layerN (padrão 1)")
     ap.add_argument("--tag", default="", help="sufixo no nome dos resultados (não sobrescreve rodadas)")
     args = ap.parse_args()
     if args.selftest:
